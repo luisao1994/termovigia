@@ -89,6 +89,24 @@ class MainActivity : Activity() {
         root.addView(bar)
         setContentView(root)
 
+        // Android 15+ desenha o app por baixo da barra de status e dos botões de navegação:
+        // empurra o cabeçalho para baixo e as abas para cima, para nada ficar escondido.
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            val top: Int; val bottom: Int; val left: Int; val right: Int
+            if (Build.VERSION.SDK_INT >= 30) {
+                val sb = insets.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+                top = sb.top; bottom = sb.bottom; left = sb.left; right = sb.right
+            } else {
+                @Suppress("DEPRECATION")
+                run { top = insets.systemWindowInsetTop; bottom = insets.systemWindowInsetBottom; left = insets.systemWindowInsetLeft; right = insets.systemWindowInsetRight }
+            }
+            header.setPadding(dp(18) + left, dp(12) + top, dp(18) + right, dp(8))
+            scroll.setPadding(left, 0, right, 0)
+            bar.setPadding(dp(6) + left, dp(6), dp(6) + right, dp(6) + bottom)
+            insets
+        }
+        root.requestApplyInsets()
+
         tab = intent?.getIntExtra("tab", 0) ?: 0
         if (savedInstanceState == null && !Prefs.enabled(this) && db.count() == 0) firstRun()
     }
