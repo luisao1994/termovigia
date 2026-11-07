@@ -40,6 +40,16 @@ class MainActivity : Activity() {
     private var refreshN = 0
     private var resumed = false
 
+    // carregamento ao vivo
+    private class ChargeView(
+        val startTs: Long, val startLevel: Int, val avgW: Float, val peakW: Float,
+        val counterW: Float, val usbW: Float, val usbV: Float, val usbA: Float
+    )
+    private var livePeakW = 0f
+    private var lastCounter: Pair<Long, Long>? = null // (ts, µAh)
+    private var counterW = -1f
+    private var wasCharging = false
+
     // peças da aba "Agora" atualizadas ao vivo
     private var liveBox: LinearLayout? = null
     private var chart: ChartView? = null
@@ -142,7 +152,7 @@ class MainActivity : Activity() {
             if (!resumed) return
             if (tab == 0) refreshNow(++refreshN % 5 == 0)
             updateHeader()
-            main.postDelayed(this, 3000)
+            main.postDelayed(this, if (wasCharging && tab == 0) 2000 else 3000)
         }
     }
 
@@ -215,13 +225,15 @@ class MainActivity : Activity() {
             val first = db.firstTs()
             val n = db.count()
             val lastApp = svcLastApp(svc)
-            main.post { if (tab == 0 && !isFinishing) renderLive(s, zones, cores, causes, hist, lastApp, first, n) }
+            val cv = chargeView(s, since)
+            main.post { if (tab == 0 && !isFinishing) renderLive(s, zones, cores, causes, hist, lastApp, first, n, cv) }
         }
     }
 
-    private fun renderLive(s: Sample, zones: List<Zone>, cores: List<Core>, causes: List<String>, hist: List<Sample>?, lastApp: String?, first: Long, n: Int) {
+    private fun renderLive(s: Sample, zones: List<Zone>, cores: List<Core>, causes: List<String>, hist: List<Sample>?, lastApp: String?, first: Long, n: Int, cv: ChargeView?) {
         val box = liveBox ?: return
         box.removeAllViews()
+        if (s.charging && cv != null) box.addView(chargeCard(s, cv))
 
         // cartão grande
         val big = Ui.card(this)
@@ -279,6 +291,74 @@ class MainActivity : Activity() {
             if (zones.isNotEmpty()) zones.take(15).forEach { z -> hb.addView(Ui.kv(this, z.type, F.t(z.temp), Ui.tempColor(z.temp))) }
             else hb.addView(Ui.text(this, "O HyperOS bloqueia a leitura direta desses sensores para apps comuns. O TermoVigia usa a temperatura da bateria e o estado térmico oficial do Android, que são confiáveis para descobrir o aquecimento.", 13f, Ui.MUTED))
         }
+    }
+
+    /** Roda na thread de fundo: junta a carga atual a partir do histórico + leituras ao vivo. */
+    private fun chargeView(s: Sample, now: Long): ChargeView? {
+        if (!s.charging) {
+            if (wasCharging) { livePeakW = 0f; lastCounter = null; counterW = -1f }
+            wasCharging = false
+            return null
+        }
+        if (!wasCharging) { livePeakW = 0f; lastCounter = null; counterW = -1f }
+        wasCharging = true
+        val w = s.watts
+        if (w > livePeakW) livePeakW = w
+
+        // início desta carga: volta no histórico até a última leitura fora da tomada
+        val hist = db.samples(now - 24 * 3_600_000L)
+        var i = hist.size - 1
+        while (i > 0 && hist[i].charging && hist[i].ts - hist[i - 1].ts < 10 * 60_000L && hist[i - 1].charging) i--
+        val sess = if (i in hist.indices && hist[i].charging) hist.subList(i, hist.size) else emptyList()
+        val startTs = sess.firstOrNull()?.ts ?: now
+        val startLevel = sess.firstOrNull()?.level ?: s.level
+        val ws = sess.map { it.watts }.filter { it > 0 }
+        val avg = if (ws.isNotEmpty()) ws.average().toFloat() else w
+        val peak = maxOf(livePeakW, ws.maxOrNull() ?: 0f)
+
+        // conferência independente: quanto a carga da bateria (µAh) cresceu por segundo
+        val raw = col.chargeRaw()
+        if (raw.counterUah > 0) {
+            val prev = lastCounter
+            if (prev == null) lastCounter = now to raw.counterUah
+            else if (now - prev.first >= 20_000L) {
+                val dUah = raw.counterUah - prev.second
+                val h = (now - prev.first) / 3_600_000f
+                val wCalc = (dUah / 1000f / h) * s.voltageMv / 1_000_000f
+                counterW = if (wCalc > 0.2f && wCalc < 200f) wCalc else -1f
+                lastCounter = now to raw.counterUah
+            }
+        }
+        return ChargeView(startTs, startLevel, avg, peak, counterW,
+            if (raw.usbV > 0 && raw.usbA > 0) raw.usbV * raw.usbA else -1f, raw.usbV, raw.usbA)
+    }
+
+    private fun chargeCard(s: Sample, cv: ChargeView): View {
+        val c = Ui.card(this, Ui.CARD2)
+        c.addView(Ui.text(this, "⚡ Carregando agora", 15.5f, Ui.TEXT, true))
+        val w = s.watts
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.BOTTOM }
+        row.addView(Ui.text(this, F.w(w), 44f, Ui.ACCENT, true))
+        row.addView(Ui.text(this, "  entrando na bateria", 14f, Ui.MUTED).apply { setPadding(0, 0, 0, dp(10)) })
+        c.addView(row)
+        c.addView(Ui.text(this, "${s.currentMa} mA × ${F.d1(s.voltageMv / 1000f)} V", 13f, Ui.MUTED))
+        c.addView(Ui.kv(this, "Pico desta carga", F.w(cv.peakW), Ui.ACCENT))
+        c.addView(Ui.kv(this, "Média desta carga", F.w(cv.avgW)))
+        val min = (System.currentTimeMillis() - cv.startTs) / 60_000f
+        c.addView(Ui.kv(this, "Carregando há", F.mins(min)))
+        val gained = s.level - cv.startLevel
+        c.addView(Ui.kv(this, "Ganhou", "+$gained%  (de ${cv.startLevel}% para ${s.level}%)"))
+        if (min >= 3f && gained > 0) {
+            val perMin = gained / min
+            c.addView(Ui.kv(this, "Velocidade", "${F.d1(perMin)}% por minuto"))
+            if (s.level < 100) c.addView(Ui.kv(this, "Previsão até 100%", "~" + F.mins((100 - s.level) / perMin)))
+        }
+        c.addView(Ui.kv(this, "Tipo", when (s.plug) { 1 -> "Carregador na tomada"; 2 -> "USB (computador/fraco)"; 4 -> "Sem fio"; else -> "—" }))
+        if (cv.counterW > 0) c.addView(Ui.kv(this, "Conferência (contador da bateria)", F.w(cv.counterW)))
+        if (cv.usbW > 0) c.addView(Ui.kv(this, "Entrada do cabo USB", "${F.w(cv.usbW)}  (${F.d1(cv.usbV)} V × ${F.d1(cv.usbA)} A)"))
+        c.addView(Ui.kv(this, "Temperatura", F.t(s.batTemp), Ui.tempColor(s.batTemp)))
+        c.addView(Ui.text(this, "Medido na bateria, já descontado o que o celular gasta ligado. O carregador entrega um pouco mais (10–15% se perde em calor). A potência máxima anunciada só aparece por poucos minutos, com bateria baixa (abaixo de ~50%), celular frio e sem uso; depois o sistema reduz de propósito. Se estiver quente, ele corta a velocidade.", 12f, Ui.MUTED).apply { setPadding(0, dp(8), 0, 0) })
+        return c
     }
 
     private fun svcLastApp(svc: Sample?): String? {

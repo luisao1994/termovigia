@@ -21,6 +21,9 @@ import kotlin.math.abs
 data class Core(val id: Int, val curKhz: Int, val maxKhz: Int)
 data class Zone(val type: String, val temp: Float)
 
+/** Dados extras do carregamento: contador de carga da bateria e entrada USB (se o sistema deixar ler). */
+data class ChargeRaw(val counterUah: Long, val usbV: Float, val usbA: Float)
+
 /** Lê tudo o que o Android deixa um app comum ler sobre aquecimento e consumo. */
 class Collector(private val c: Context) {
     private val pm = c.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -78,6 +81,18 @@ class Collector(private val c: Context) {
         var ma = abs(raw)
         if (ma > 30_000) ma /= 1000 // veio em microampère
         return ma
+    }
+
+    fun chargeRaw(): ChargeRaw {
+        val counter = try { bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER).toLong() } catch (e: Throwable) { -1L }
+        val base = "/sys/class/power_supply/usb/"
+        var v = (readLong(base + "voltage_now") ?: -1L).toFloat()
+        v = when { v > 100_000f -> v / 1_000_000f; v > 1000f -> v / 1000f; else -> v }
+        var a = (readLong(base + "input_current_now") ?: readLong(base + "current_now") ?: -1L).toFloat()
+        a = kotlin.math.abs(a)
+        a = if (a > 30_000f) a / 1_000_000f else a / 1000f
+        val ok = v in 3f..25f && a in 0.05f..15f
+        return ChargeRaw(if (counter == Long.MIN_VALUE || counter == Int.MIN_VALUE.toLong()) -1L else counter, if (ok) v else -1f, if (ok) a else -1f)
     }
 
     fun cores(): List<Core> {
